@@ -11,9 +11,25 @@ wrong values after reload whenever its prepacked blob sits at a file offset
 that is not a multiple of 64. Blobs smaller than 1 MiB are written unaligned,
 right after the previous initializer. The MLAS x86 packed layout aligns its
 sub-buffers (packed B, block sums, scales) to 64 bytes relative to the
-buffer's own address. The blob is used in place at the new, unaligned
-address, so the kernel reads every sub-buffer from the wrong position.
+buffer's own address. When memory-mapped on the tested x86-64 systems, the
+blob is used in place at an address with the same residue mod 64 as its file
+offset; for the affected accuracy_level=4 layout a nonzero residue shifts the
+interpreted packed-data, block-sum and scale offsets.
 One node and M=1 are enough; graph fusions play no part.
+
+Consumption check: ORT re-packs every weight at load time and only swaps in
+the blob from disk when its key (a hash of the freshly packed bytes) matches,
+so a silent in-memory repack would also "match". The loader selects a disk
+blob by the key string stored in the proto and does not hash or checksum the
+blob bytes (the checksum field is written as 0 and not validated), so a
+corrupted blob is still selected. After the prepacked run the script therefore
+XORs every prepacked blob range in a copy of the .data file with 0xFF, reloads,
+and requires the output to change (consumed=yes). If a future version validated
+the bytes, the corrupted blob would be rejected and the case would be reported
+inconclusive, not as a pass.
+
+Exit codes: 0 = every case matches and its blob was consumed, 1 = mismatch
+(bug reproduced), 2 = no mismatch but at least one case is inconclusive.
 
     python repro_33677.py                 # one MatMulNBits node, exit 1 on mismatch
     python repro_33677.py --sweep         # matrix incl. aligned / accuracy_level 0 controls
@@ -25,6 +41,7 @@ import argparse
 import json
 import os
 import platform
+import shutil
 import sys
 import tempfile
 
@@ -175,7 +192,9 @@ def save_prepacked(src: str, dst: str, args) -> None:
 
 def run(path: str, x: np.ndarray, args) -> np.ndarray:
     s = ort.InferenceSession(path, options(args), providers=["CPUExecutionProvider"])
-    return s.run(None, {s.get_inputs()[0].name: x})[0]
+    y = s.run(None, {s.get_inputs()[0].name: x})[0]
+    del s  # release the session (and its mapping of the .data file) before temp files are deleted
+    return y
 
 
 def compare(a: np.ndarray, b: np.ndarray) -> dict:
@@ -186,14 +205,35 @@ def compare(a: np.ndarray, b: np.ndarray) -> dict:
     return {"max_abs": float(np.abs(a - b).max()), "cos": cos}
 
 
-def prepacked_offsets(path: str) -> list[int]:
-    """Byte offsets of the prepacked blobs inside the saved .data file."""
-    offs = []
+def prepacked_blobs(path: str) -> list[tuple[str, int, int]]:
+    """(data file, offset, length) of every prepacked blob in the saved model."""
+    blobs = []
     for t in onnx.load(path, load_external_data=False).graph.initializer:
-        for e in t.external_data:
-            if e.key.startswith("prepacked"):  # "<key>|<offset>;<length>;<alignment>"
-                offs.append(int(e.value.split("|")[1].split(";")[0]))
-    return offs
+        ext = {e.key: e.value for e in t.external_data}
+        for key, value in ext.items():
+            # "<key>|<offset>;<length>;<checksum>[|<offset>;<length>;<checksum>...]":
+            # one key can hold several blobs. MatMulNBits writes one, but all are listed.
+            if key.startswith("prepacked"):
+                for blob in value.split("|")[1:]:
+                    off, length = blob.split(";")[:2]
+                    blobs.append((ext["location"], int(off), int(length)))
+    return blobs
+
+
+def run_corrupted(packed: str, blobs, x: np.ndarray, args) -> np.ndarray:
+    """Run a copy of the prepacked model whose blob bytes are all XORed with 0xFF."""
+    with tempfile.TemporaryDirectory() as tmp:
+        dst = os.path.join(tmp, os.path.basename(packed))
+        shutil.copyfile(packed, dst)
+        src_dir = os.path.dirname(packed)
+        for loc in {b[0] for b in blobs}:
+            with open(os.path.join(src_dir, loc), "rb") as f:
+                data = bytearray(f.read())
+            for _, off, length in (b for b in blobs if b[0] == loc):
+                data[off:off + length] = (np.frombuffer(data, np.uint8, length, off) ^ 0xFF).tobytes()
+            with open(os.path.join(tmp, loc), "wb") as f:
+                f.write(data)
+        return run(dst, x, args)
 
 
 def case(args) -> dict:
@@ -209,15 +249,19 @@ def case(args) -> dict:
         shape = (1, args.m, args.k) if args.model in ("mlp", "transformer") else (args.m, args.k)
         x = rng.standard_normal(shape).astype(np.float32)
         y_ref, y_q, y_p = run(ref, x, args), run(q, x, args), run(packed, x, args)
-        offs = prepacked_offsets(packed)
+        blobs = prepacked_blobs(packed)
+        # The disk blob is consumed only if corrupting it changes the output.
+        consumed = bool(blobs) and not np.array_equal(run_corrupted(packed, blobs, x, args), y_p, equal_nan=True)
         r = {"model": args.model, "M": args.m, "K": args.k, "N": args.n, "block": args.block,
              "acc": args.acc, "layers": args.layers, "opt": args.opt, "threads": args.threads,
-             "prepacked_offsets_mod64": [o % 64 for o in offs],
+             "prepacked_offsets_mod64": [b[1] % 64 for b in blobs],
+             "prepacked_lengths": [b[2] for b in blobs], "consumed": consumed,
              "unpacked_vs_fp32": compare(y_q, y_ref), "prepacked_vs_unpacked": compare(y_p, y_q)}
         # The prepacked weights run the same kernel on the same packed bytes, so
         # the two loads must agree (bit-exact on every platform where it works).
         d = r["prepacked_vs_unpacked"]["max_abs"]
         r["mismatch"] = not (d <= 1e-5)  # also true for NaN
+        r["status"] = "MISMATCH" if r["mismatch"] else "ok" if consumed else "INCONCLUSIVE"
         return r
 
 
@@ -225,9 +269,10 @@ def cpu_flags() -> str:
     try:
         with open("/proc/cpuinfo") as f:
             for line in f:
-                if line.startswith("flags"):
+                if line.startswith(("flags", "Features")):  # x86 / aarch64
                     fl = set(line.split(":")[1].split())
-                    return " ".join(sorted(x for x in fl if x.startswith(("avx", "amx")) or x in ("f16c", "fma")))
+                    return " ".join(sorted(x for x in fl if x.startswith(("avx", "amx", "sve", "sme")) or
+                                           x in ("f16c", "fma", "asimd", "asimddp", "asimdhp", "i8mm", "bf16")))
     except OSError:
         pass
     if sys.platform == "win32":
@@ -275,7 +320,8 @@ def main() -> int:
     ap.add_argument("--sweep", nargs="?", const="default",
                     help="run the default matrix, or a space-separated list of model:M:K:N:acc[:threads]")
     ap.add_argument("--json", action="store_true")
-    ap.add_argument("--keep", help="write the models to this directory instead of a temp dir")
+    ap.add_argument("--keep", help="write the models to this directory instead of a temp dir "
+                                   "(one subdirectory per case with --sweep)")
     args = ap.parse_args()
 
     print(f"onnxruntime {ort.__version__}  onnx {onnx.__version__}  numpy {np.__version__}  "
@@ -290,24 +336,33 @@ def main() -> int:
             g = dict(model=f[0], m=int(f[1]), k=int(f[2]), n=int(f[3]), acc=int(f[4]))
             if len(f) > 5:
                 g["threads"] = int(f[5])
+            if args.keep:
+                g["keep"] = os.path.join(args.keep, item.replace(":", "_"))
             grid.append(g)
         results = [case(argparse.Namespace(**{**vars(args), **g})) for g in grid]
     else:
         results = [case(args)]
 
-    bad = False
+    def join(v):
+        return ",".join(map(str, sorted(set(v)))) or "-"
+
     for r in results:
-        bad |= r["mismatch"]
         if args.json:
             print(json.dumps(r))
             continue
         pv = r["prepacked_vs_unpacked"]
         print(f"{r['model']:<11} M={r['M']:<3} K={r['K']:<4} N={r['N']:<4} block={r['block']} acc={r['acc']} "
-              f"blob_off%64={','.join(map(str, sorted(set(r['prepacked_offsets_mod64'])))) or '-':<9} | "
+              f"blob_off%64={join(r['prepacked_offsets_mod64']):<9} blob_len={join(r['prepacked_lengths']):<8} | "
               f"prepacked vs unpacked: max_abs={pv['max_abs']:<9.3g} cos={pv['cos']:<9.5f} | "
-              f"{'MISMATCH' if r['mismatch'] else 'ok'}")
-    print("RESULT:", "MISMATCH (bug reproduced)" if bad else "all match")
-    return 1 if bad else 0
+              f"consumed={'yes' if r['consumed'] else 'no':<3} | {r['status']}")
+    if any(r["mismatch"] for r in results):
+        print("RESULT: MISMATCH (bug reproduced)")
+        return 1
+    if any(r["status"] == "INCONCLUSIVE" for r in results):
+        print("RESULT: INCONCLUSIVE (a prepacked blob on disk was not consumed; the match proves nothing)")
+        return 2
+    print("RESULT: all match (prepacked blobs consumed)")
+    return 0
 
 
 if __name__ == "__main__":
