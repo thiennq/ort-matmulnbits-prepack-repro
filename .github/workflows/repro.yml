@@ -1,0 +1,47 @@
+name: repro
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  repro:
+    name: ${{ matrix.os }} / onnxruntime ${{ matrix.ort }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        ort: ["1.31.1", "nightly"]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m pip install -q onnx numpy
+          if [ "${{ matrix.ort }}" = nightly ]; then
+            python -m pip install -q --pre --index-url \
+              https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ORT-Nightly/pypi/simple/ onnxruntime
+          else
+            python -m pip install -q "onnxruntime==${{ matrix.ort }}"
+          fi
+      - name: CPU
+        run: |
+          case "$RUNNER_OS" in
+            Linux) lscpu | grep -E 'Model name|Flags' | sed -E 's/(Flags:).*/\1 '"$(grep -o -w -E 'avx[0-9a-z_]*|fma|f16c|amx[a-z_]*' /proc/cpuinfo | sort -u | tr '\n' ' ')"'/' ;;
+            macOS) sysctl -n machdep.cpu.brand_string; uname -m ;;
+            Windows) powershell -NoProfile -Command "(Get-CimInstance Win32_Processor).Name" ;;
+          esac
+      - name: Repro (fails when the prepacked model disagrees)
+        run: |
+          set -o pipefail
+          python repro_33677.py --sweep | tee result.txt
+      - name: Summary
+        if: always()
+        run: |
+          { echo "### ${{ matrix.os }} / onnxruntime ${{ matrix.ort }}"; echo '```'; cat result.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
