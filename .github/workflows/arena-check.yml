@@ -1,0 +1,46 @@
+name: arena-check
+
+on:
+  push:
+    branches: [arena-check]
+
+permissions:
+  contents: read
+
+jobs:
+  arena:
+    name: ${{ matrix.os }} / onnxruntime ${{ matrix.ort }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        ort: ["1.31.1"]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: python -m pip install -q onnx==1.23.2 numpy==2.5.4 "onnxruntime==${{ matrix.ort }}"
+      - name: CPU
+        run: |
+          case "$RUNNER_OS" in
+            Linux) lscpu | grep -E 'Model name' ; grep -o -w -E 'avx[0-9a-z_]*|fma' /proc/cpuinfo | sort -u | tr '\n' ' ' ;;
+            Windows) powershell -NoProfile -Command "(Get-CimInstance Win32_Processor).Name" ;;
+          esac
+      - name: In-memory pack with the CPU arena on and off
+        run: |
+          set +e
+          python arena_check.py repro_33677.py 2>&1 | tee result.txt
+          rc=${PIPESTATUS[0]}
+          {
+            echo "### ${{ matrix.os }} / onnxruntime ${{ matrix.ort }} (exit $rc)"
+            echo '```'
+            cat result.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
